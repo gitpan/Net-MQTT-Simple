@@ -1,0 +1,8 @@
+lib/Net/MQTT/Simple.pm
+t/use.t
+Makefile.PL
+README
+Changes
+MANIFEST
+META.yml                                 Module YAML meta-data (added by MakeMaker)
+META.json                                Module JSON meta-data (added by MakeMaker)
