@@ -3,7 +3,11 @@ package Net::MQTT::Simple;
 # use strict;    # might not be available (e.g. on openwrt)
 # use warnings;  # same.
 
-our $VERSION = '1.01';
+our $VERSION = '1.10';
+
+# Please note that these are not documented and are subject to change:
+our $KEEPALIVE_INTERVAL = 10;
+our $MAX_LENGTH = 2097152;  # 2 MB
 
 my $global;
 my $socket_class =
@@ -14,6 +18,22 @@ my $socket_class =
 # Carp might not be available either.
 sub _croak {
     die sprintf "%s at %s line %d.\n", "@_", (caller 1)[1, 2];
+}
+
+sub _filter_as_regex {
+    my ($filter) = @_;
+
+    return "^(?!\\\$)" if $filter eq '#';   # Match everything except /^\$/
+    return "^(?!\\\$)" if $filter eq '/#';  # Match everything except /^\$/
+
+    $filter = quotemeta $filter;
+
+    $filter =~ s{ \z (?<! \\ \/ \\ \# ) }"\\z"x;       # Anchor unless /#$/
+    $filter =~ s{ \\ \/ \\ \#           }""x;
+    $filter =~ s{ \\ \+                 }"[^/]*+"xg;
+    $filter =~ s{ ^ (?= \[ \^ / \] \* ) }"(?!\\\$)"x;  # No /^\$/ if /^\+/
+
+    return "^$filter";
 }
 
 sub import {
@@ -54,6 +74,8 @@ sub _connect {
             )
         )
     );
+
+    $self->_send_subscribe;
 }
 
 sub _prepend_variable_length {
@@ -73,8 +95,92 @@ sub _prepend_variable_length {
 
 sub _send {
     my ($self, $data) = @_;
+
+    $self->_connect;
     my $socket = $self->{socket};
-    syswrite $socket, $data;
+    syswrite $socket, $data
+        or delete $self->{socket};  # reconnect on next message
+
+    $self->{last_send} = time;
+}
+
+sub _send_subscribe {
+    my ($self) = @_;
+
+    return if not exists $self->{sub};
+
+    # Hardcoded "packet identifier" \0\0 for now. Hello? This is TCP.
+    $self->_send("\x82" . _prepend_variable_length(
+        "\0\0" .
+        join("", map "$_\0",
+            map pack("n/a*", $_), keys %{ $self->{sub} } 
+        )
+    ));
+}
+
+sub _parse {
+    my ($self) = @_;
+
+    my $bufref = \$self->{buffer};
+
+    return if length $$bufref < 2;
+
+    my $offset = 1;
+
+    my $length = do {
+        my $multiplier = 1;
+        my $v = 0;
+        my $d;
+        do {
+            return if $offset >= length $$bufref;  # not enough data yet
+            $d = unpack "C", substr $$bufref, $offset++, 1;
+            $v += ($d & 0x7f) * $multiplier;
+            $multiplier *= 128;
+        } while ($d & 0x80);
+        $v;
+    };
+
+    if ($length > $MAX_LENGTH) {
+        # On receiving an enormous packet, just disconnect to avoid exhausting
+        # RAM on tiny systems.
+        # TODO: just slurp and drop the data
+        delete $self->{socket};
+        return;
+    }
+
+    return if $length > (length $$bufref) + $offset;  # not enough data yet
+
+    my $first_byte = unpack "C", substr $$bufref, 0, 1;
+
+    my $packet = {
+        type   => ($first_byte & 0xF0) >> 4,
+        dup    => ($first_byte & 0x08) >> 3,
+        qos    => ($first_byte & 0x06) >> 1,
+        retain => ($first_byte & 0x01),
+        data   => substr($$bufref, $offset, $length),
+    };
+
+    substr $$bufref, 0, $offset + $length, "";  # remove the parsed bits.
+
+    return $packet;
+}
+
+sub _incoming_publish {
+    my ($self, $packet) = @_;
+
+    # Because QoS is not supported, no packed ID in the data. It would
+    # have been 16 bits between $topic and $message.
+    my ($topic, $message) = unpack "n/a a*", $packet->{data};
+
+    utf8::decode($topic);
+    utf8::decode($message);
+
+    for my $cb (@{ $self->{callbacks} }) {
+        if ($topic =~ /$cb->{regex}/) {
+            $cb->{callback}->($topic, $message);
+            return;
+        }
+    }
 }
 
 sub _publish {
@@ -82,7 +188,6 @@ sub _publish {
 
     $message //= "" if $retain;
 
-    $self->_connect;
     utf8::encode($topic);
     utf8::encode($message);
 
@@ -108,13 +213,66 @@ sub retain {
     ($method ? shift : $global)->_publish(1, @_);
 }
 
+sub run {
+    my ($self, @subscribe_args) = @_;
+
+    $self->subscribe(@subscribe_args) if @subscribe_args;
+
+    $self->tick( time() - $self->{ last_send } + $KEEPALIVE_INTERVAL )
+        until $self->{stop_loop};
+
+    delete $self->{stop_loop};
+}
+
+sub subscribe {
+    my ($self, @kv) = @_;
+
+    while (my ($topic, $callback) = splice @kv, 0, 2) {
+        $self->{sub}->{ $topic } = 1;
+        push @{ $self->{callbacks} }, {
+            regex => _filter_as_regex($topic),
+            callback => $callback,
+        };
+    }
+
+    $self->_send_subscribe() if $self->{socket};
+}
+
+sub tick {
+    my ($self, $timeout) = @_;
+
+    $self->_connect;
+    my $socket = $self->{socket};
+
+    my $bufref = \$self->{buffer};
+
+    my $r = '';
+    vec($r, fileno($socket), 1) = 1;
+
+    if (select $r, undef, undef, $timeout // 0) {
+        sysread $socket, $$bufref, 8192, length $$bufref
+            or delete $self->{socket};
+
+        while (length $$bufref) {
+            my $packet = $self->_parse() or last;
+            $self->_incoming_publish($packet) if $packet->{type} == 3;
+        }
+    }
+
+    if ($self->{last_send} <= time() + $KEEPALIVE_INTERVAL) {
+        $self->_send("\xc0\0");  # PINGREQ
+    }
+
+    return !! $self->{socket};
+}
+
 1;
 
 __END__
 
 =head1 NAME
 
-Net::MQTT::Simple - Minimal MQTT version 3 publisher
+Net::MQTT::Simple - Minimal MQTT version 3 interface
 
 =head1 SYNOPSIS
 
@@ -132,17 +290,28 @@ Net::MQTT::Simple - Minimal MQTT version 3 publisher
     retain  "topic/here" => "Retained message here";
 
 
-    # Object oriented (supports multiple servers)
+    # Object oriented (supports subscribing to topics)
 
     use Net::MQTT::Simple;
 
-    my $mqtt1 = Net::MQTT::Simple->new("mosquitto.example.org");
-    my $mqtt2 = Net::MQTT::Simple->new("mosquitto.example.com");
+    my $mqtt = Net::MQTT::Simple->new("mosquitto.example.org");
 
-    for my $server ($mqtt1, $mqtt2) {
-        $server->publish("topic/here" => "Message here");
-        $server->retain( "topic/here" => "Message here");
+    $mqtt->publish("topic/here" => "Message here");
+    $mqtt->retain( "topic/here" => "Message here");
+
+    sub callback {
+
+    $mqtt->run(
+        "sensors/+/temperature" => sub {
+            my ($topic, $message) = @_;
+            die "The building's on fire" if $message > 150;
+        },
+        "#" => sub {
+            my ($topic, $message) = @_;
+            print "[$topic] $message\n";
+        },
     }
+    );
 
 
 =head1 DESCRIPTION
@@ -163,7 +332,8 @@ warnings (on STDERR if you didn't override that) without throwing an exception.
 =head2 Functional interface
 
 This will suffice for most simple sensor scripts. A socket is kept open for
-reuse until the script has finished.
+reuse until the script has finished. The functional interface cannot be used
+for subscriptions, only for publishing.
 
 Instead of requesting symbols to be imported, provide the MQTT server on the
 C<use Net::MQTT::Simple> line. A non-standard port can be specified with a
@@ -191,6 +361,31 @@ To discard a retained topic, provide an empty or undefined message.
 
 Publishes the message with the C<retain> flag off. Use this for ephemeral
 messages about events that occur (like that a button was pressed).
+
+=head1 SUBSCRIPTIONS
+
+=head2 subscribe(topic, handler[, topic, handler, ...])
+
+Subscribes to the given topic(s) and registers the callbacks. Note that only
+the first matching handler will be called for every message, even if filter
+patterns overlap.
+
+=head2 run(...)
+
+Enters an infinite loop, which calls C<tick> repeatedly. If any arguments
+are given, they will be passed to C<subscribe> first.
+
+=head2 tick(timeout)
+
+Test the socket to see if there's any incoming message, waiting at most
+I<timeout> seconds (can be fractional). Use a timeout of C<0> to avoid
+blocking, but note that blocking automatic reconnection may take place, which
+may take much longer.
+
+If C<tick> returns false, this means the socket was no longer connected.
+However, a true value does not necessarily mean that the socket is still
+functional. The only way to reliably determine that a TCP stream is
+still connected, is to write data, which is only done periodically.
 
 =head1 IPv6 PREREQUISITE
 
@@ -230,20 +425,48 @@ indicate that it has already been sent before.
 No username and password are sent to the server and the connection will be set
 up without TLS or SSL.
 
-=item Subscriptions
-
-This is a write-only implementation, meant for sensor equipment.
-
 =item Last will
 
 The server won't publish a "last will" message on behalf of us when our
 connection's gone.
 
-=item Keep-alives
+=item Large data
 
-You'll have to wait for the TCP timeout instead.
+Because everything is handled in memory and there's no way to indicate to the
+server that large messages are not desired, the connection is dropped as soon
+as the server announces a packet larger than 2 megabytes.
+
+=item Validation of server-to-client communication
+
+The MQTT spec prescribes mandatory validation of all incoming data, and
+disconnecting if anything (really, anything) is wrong with it. However, this
+minimal implementation silently ignores anything it doesn't specifically
+handle, which may result in weird behaviour if the server sends out bad data.
+
+Most clients do not adhere to this part of the specifications.
 
 =back
+
+=head1 CAVEATS
+
+=head2 Automatic reconnection
+
+Connection and reconnection are handled automatically, but without retries. If
+anything goes wrong, this will cause a single reconnection attempt before the
+following action. For example, if sending a message fails because of a
+disconnected socket, the message will not be resent, but the next message might
+succeed. This behaviour is intended.
+
+=head2 Unicode
+
+This module uses the proper Perl Unicode abstractions, which mean that
+arguments for I<topic> and I<message> are Unicode text strings, not UTF-8
+encoded binary data. Encoding and decoding is handled transparently within this
+module.
+
+For you, this means that if you use any literal UTF-8 in your code, you need to
+C<use utf8;>, and that if you read or write data on filehandles, you must inform
+Perl about this fact first (e.g. with C<binmode STDOUT, ":encoding(utf8)";>.
 
 =head1 LICENSE
 

@@ -1,5 +1,5 @@
 {
-   "abstract" : "Minimal MQTT version 3 publisher",
+   "abstract" : "Minimal MQTT version 3 interface",
    "author" : [
       "Juerd Waalboer <juerd@cpan.org>"
    ],
@@ -35,5 +35,5 @@
       }
    },
    "release_status" : "stable",
-   "version" : "1.01"
+   "version" : "1.10"
 }
