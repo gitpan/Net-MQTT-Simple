@@ -78,15 +78,21 @@ my @matrix = (
     # Topic             Should match all of these, but none of the
     #                   other ones that are listed for other topics.
     [ "foo",            qw(# /# +   foo/# foo) ],
-    [ "foo/bar",        qw(# /# +/+ foo/# foo/bar/# foo/+ +/bar) ],
+    [ "foo/bar",        qw(# /# +/+ foo/# foo/bar/# foo/+ +/bar foo/+/#) ],
+    [ "foo//bar",       qw(# /# +/+/+ foo/# foo//bar foo/+/bar foo/+/#
+                           foo//+) ],
     [ "/foo",           qw(# /# +/+ /foo /foo/#) ],
     [ "/\$foo",         qw(# /# +/+ /$foo /$foo/#) ],  # Not special
+    [ "/foo/bar",       qw(# /# +/+/+ /foo/#)],
     [ "///",            qw(# /# +/+/+/+) ],
-    [ "foo/bar/baz",    qw(# /# +/+/+ foo/# foo/bar/#
+    [ "foo/bar/baz",    qw(# /# +/+/+ foo/# foo/bar/# foo/+/#
                            +/bar/baz foo/+/baz foo/bar/+ +/+/baz) ],
     [ "\$foo",          qw($foo $foo/#) ],  # Special because it begins with $
     [ "\$SYS/foo",      qw($SYS/# $SYS/+ $SYS/foo) ],
     [ "\$SYS/foo/bar",  qw($SYS/# $SYS/+/+ $SYS/foo/bar $SYS/+/bar $SYS/foo/+)],
+    [ "fo2/bar/baz",    qw(# /# fo2/bar/baz +/+/+ +/+/baz +/bar/baz) ],
+    [ "foo///baz",      qw(# /# foo/# foo/+/# foo/+/+/baz +/+/+/+) ],
+    [ "foo/bar/",       qw(# /# foo/# foo/+/# foo/bar/+ foo/bar/# +/+/+)],
 );
 
 my %all_filters;
@@ -110,5 +116,41 @@ for (@matrix) {
         unlike($topic, qr/$regex/, "'$topic' should not match '$filter'");
     }
 }
+
+# These are from mosquitto's 03-pattern-matching.py
+my @mosquitto_tests = split "\n", <<'END';
+pattern_test("#", "test/topic")
+pattern_test("#", "/test/topic")
+pattern_test("foo/#", "foo/bar/baz")
+pattern_test("foo/+/baz", "foo/bar/baz")
+pattern_test("foo/+/baz/#", "foo/bar/baz")
+pattern_test("foo/+/baz/#", "foo/bar/baz/bar")
+pattern_test("foo/foo/baz/#", "foo/foo/baz/bar")
+pattern_test("foo/#", "foo")
+pattern_test("/#", "/foo")
+pattern_test("test/topic/", "test/topic/")
+pattern_test("test/topic/+", "test/topic/")
+pattern_test("+/+/+/+/+/+/+/+/+/+/test", "one/two/three/four/five/six/seven/eight/nine/ten/test")
+
+pattern_test("#", "test////a//topic")
+pattern_test("#", "/test////a//topic")
+pattern_test("foo/#", "foo//bar///baz")
+pattern_test("foo/+/baz", "foo//baz")
+pattern_test("foo/+/baz//", "foo//baz//")
+pattern_test("foo/+/baz/#", "foo//baz")
+pattern_test("foo/+/baz/#", "foo//baz/bar")
+pattern_test("foo//baz/#", "foo//baz/bar")
+pattern_test("foo/foo/baz/#", "foo/foo/baz/bar")
+pattern_test("/#", "////foo///bar")
+END
+
+sub pattern_test {
+    my ($pattern, $match) = @_;
+    my $regex = far($pattern);
+    like($match, qr/$regex/, "mosquitto: '$match' should match '$pattern'");
+}
+
+eval for @mosquitto_tests;
+
 
 done_testing;
